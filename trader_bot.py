@@ -10,6 +10,9 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
+import nest_asyncio
+
+nest_asyncio.apply()  # to allow nested event loops (Flask + asyncio)
 
 # --- ENVIRONMENT ---
 TOKEN = os.getenv("TOKEN")
@@ -25,9 +28,10 @@ def home():
     return "Bot is live!"
 
 @flask_app.route(WEBHOOK_PATH, methods=["POST"])
-async def webhook():
+def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
-    await application.update_queue.put(update)
+    # Process update asynchronously
+    asyncio.create_task(application.process_update(update))
     return "ok"
 
 def run_flask():
@@ -117,13 +121,22 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_m
 async def start_bot():
     await bot.set_webhook(WEBHOOK_URL)
     print(f"Webhook set to {WEBHOOK_URL}")
+
+    # Start Flask app in background thread
     Thread(target=run_flask).start()
 
+    # Initialize and start telegram application (no polling!)
     await application.initialize()
     await application.start()
-    await application.updater.start_polling()  # Required to process update queue
+
     print("Bot running (with webhook)...")
-    await application.updater.wait_until_closed()
+
+    # Start webhook mode to receive updates
+    await application.run_webhook(
+        listen="0.0.0.0",
+        port=8080,
+        webhook_url=WEBHOOK_URL,
+    )
 
 if __name__ == "__main__":
     asyncio.run(start_bot())
