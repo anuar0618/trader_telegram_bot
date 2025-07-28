@@ -1,41 +1,55 @@
 import json
 import os
+import asyncio
 from flask import Flask, request
 from threading import Thread
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update, ReplyKeyboardMarkup, Bot
-from telegram.ext import (ApplicationBuilder, CommandHandler, MessageHandler,
-                          ContextTypes, filters, CallbackContext)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# --- Flask setup ---
-app = Flask(__name__)
+# --- ENVIRONMENT ---
+TOKEN = os.getenv("TOKEN")
+GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
+WEBHOOK_PATH = f"/{TOKEN}"
+WEBHOOK_URL = f"https://trader-telegram-bot.onrender.com{WEBHOOK_PATH}"
 
-@app.route('/')
+# --- Flask app for Render ---
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
 def home():
     return "Bot is live!"
 
-@app.route(f'/{os.getenv("TOKEN")}', methods=['POST'])
-def webhook():
+@flask_app.route(WEBHOOK_PATH, methods=["POST"])
+async def webhook():
     update = Update.de_json(request.get_json(force=True), bot)
-    application.create_task(application.process_update(update))
-    return 'ok'
+    await application.update_queue.put(update)
+    return "ok"
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=8080)
 
 # --- Google Sheets Setup ---
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
 ]
-creds_dict = json.loads(os.getenv("GOOGLE_CREDENTIALS"))
+creds_dict = json.loads(GOOGLE_CREDENTIALS)
 creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 client = gspread.authorize(creds)
 
-# --- Globals ---
-TOKEN = os.getenv("TOKEN")
+# --- Telegram Bot Setup ---
 bot = Bot(token=TOKEN)
+application = ApplicationBuilder().token(TOKEN).build()
+
+# --- In-Memory User States ---
 user_states = {}
 
-# --- Google Sheets Helper ---
+# --- Helper ---
 def get_sheet_data(sheet_name: str, cell: str):
     sheet = client.open("Trading strategies").worksheet(sheet_name)
     return sheet.acell(cell).value
@@ -67,14 +81,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if second_choice == "📊 1w (weekly candle analysis)":
             value = get_sheet_data(coin, "A2")
             await update.message.reply_text(f"📊 Weekly candle analysis for {coin}:\n{value}")
-            keyboard = [["\ud83d\udcc8 Project analysis"], ["�\udd19 Back to Main Menu"]]
+            keyboard = [["📈 Project analysis"], ["🔙 Back to Main Menu"]]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             return await update.message.reply_text("What next?", reply_markup=reply_markup)
 
         elif second_choice == "📈 Project analysis":
             value = get_sheet_data(coin, "B2")
             await update.message.reply_text(f"📈 Project analysis for {coin}:\n{value}")
-            keyboard = [["\ud83d\udcca 1w (weekly candle analysis)"], ["�\udd19 Back to Main Menu"]]
+            keyboard = [["📊 1w (weekly candle analysis)"], ["🔙 Back to Main Menu"]]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             return await update.message.reply_text("What next?", reply_markup=reply_markup)
 
@@ -88,20 +102,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif text in ["BTC", "BNB", "ADA", "ETH", "DOGE", "SOL"]:
         user_states[user_id] = {"first_button": text}
-        keyboard = [["\ud83d\udcca 1w (weekly candle analysis)"], ["\ud83d\udcc8 Project analysis"],
-                    ["�\udd19 Back to Main Menu"]]
+        keyboard = [["📊 1w (weekly candle analysis)"], ["📈 Project analysis"], ["🔙 Back to Main Menu"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         await update.message.reply_text(f"You selected {text}. Now choose an option:", reply_markup=reply_markup)
+
     else:
         await update.message.reply_text("Please choose one of the available options:", reply_markup=main_reply_markup)
 
-# --- Telegram App Init ---
-application = ApplicationBuilder().token(TOKEN).build()
+# --- Register Handlers ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-# --- Webhook Start ---
-if __name__ == '__main__':
-    print("Setting webhook...")
-    bot.set_webhook(url=f"https://trader-telegram-bot.onrender.com/{TOKEN}")
-    Thread(target=lambda: app.run(host="0.0.0.0", port=8080)).start()
+# --- Start Everything ---
+async def start_bot():
+    await bot.set_webhook(WEBHOOK_URL)
+    print(f"Webhook set to {WEBHOOK_URL}")
+    Thread(target=run_flask).start()
+
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()  # Required to process update queue
+    print("Bot running (with webhook)...")
+    await application.updater.wait_until_closed()
+
+if __name__ == "__main__":
+    asyncio.run(start_bot())
